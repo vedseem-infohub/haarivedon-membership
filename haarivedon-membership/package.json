@@ -1,0 +1,9 @@
+{
+  "name": "haarivedon-membership",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Haarivedon 365-Day Membership + Draftsmanship Course landing page with Razorpay checkout and lead storage",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
