@@ -49,8 +49,11 @@
       var pw = sessionStorage.getItem('hv_admin') || '';
       var all = [];
       var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
+      var API_BASE = ((location.hostname === 'localhost' || location.hostname === '127.0.0.1') && location.port && location.port !== '3000')
+        ? (location.protocol + '//' + location.hostname + ':3000')
+        : '';
       function load() {
-        return fetch('/api/admin/leads', { headers: { 'x-admin-password': pw } }).then(function (r) {
+        return fetch(API_BASE + '/api/admin/leads', { headers: { 'x-admin-password': pw } }).then(function (r) {
           if (!r.ok) throw new Error('Wrong password');
           return r.json();
         }).then(function (j) {
@@ -73,7 +76,7 @@
       ['fp', 'fs', 'q'].forEach(function (id) { document.getElementById(id).addEventListener('input', render); });
       document.getElementById('refresh').addEventListener('click', load);
       document.getElementById('csv').addEventListener('click', function () {
-        fetch('/api/admin/leads?format=csv', { headers: { 'x-admin-password': pw } }).then(function (r) { return r.blob(); }).then(function (b) {
+        fetch(API_BASE + '/api/admin/leads?format=csv', { headers: { 'x-admin-password': pw } }).then(function (r) { return r.blob(); }).then(function (b) {
           var a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'haarivedon-leads.csv'; document.body.appendChild(a); a.click(); a.remove();
         });
       });

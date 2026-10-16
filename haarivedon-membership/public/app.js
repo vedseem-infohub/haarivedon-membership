@@ -20,12 +20,16 @@
   var ua = navigator.userAgent || '';
   var isInApp = /FBAN|FBAV|FB_IAB|Instagram|Line\/|Snapchat|LinkedInApp|Twitter/i.test(ua);
 
+  // If accessed via a static dev server (like VS Code Live Server on port 5500), route API calls to Node server on port 3000
+  var API_BASE = ((location.hostname === 'localhost' || location.hostname === '127.0.0.1') && location.port && location.port !== '3000')
+    ? (location.protocol + '//' + location.hostname + ':3000')
+    : '';
+
   function post(url, data) {
-    return fetch(url, {
+    return fetch(API_BASE + url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
-      credentials: 'same-origin',
     }).then(function (r) {
       return r.text().then(function (rawText) {
         var j = {};
@@ -186,7 +190,7 @@
       };
       if (isInApp) {
         options.redirect = true;
-        var cb = location.origin + '/api/razorpay/callback?lead=' + encodeURIComponent(leadId);
+        var cb = (API_BASE || location.origin) + '/api/razorpay/callback?lead=' + encodeURIComponent(leadId);
         if (leadToken) cb += '&token=' + encodeURIComponent(leadToken);
         options.callback_url = cb;
       }

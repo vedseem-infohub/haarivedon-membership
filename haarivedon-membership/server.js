@@ -465,6 +465,17 @@ const server = http.createServer(async (req, res) => {
   const rawUrl = req.headers['x-matched-path'] || req.headers['x-forwarded-uri'] || req.url || '/';
   const resolvedUrl = rawUrl.startsWith('/api/') ? rawUrl : req.url;
   const url = new URL(resolvedUrl, `http://${host}`);
+
+  // Enable CORS for local dev servers (e.g. VS Code Live Server on port 5500)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-password');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    return res.end();
+  }
+
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed');
