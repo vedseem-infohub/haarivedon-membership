@@ -27,8 +27,13 @@
       body: JSON.stringify(data),
       credentials: 'same-origin',
     }).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (j) {
-        if (!r.ok) throw new Error(j.error || 'Something went wrong. Please try again.');
+      return r.text().then(function (rawText) {
+        var j = {};
+        try { j = JSON.parse(rawText); } catch (_) {}
+        if (!r.ok) {
+          var msg = j.error || j.message || (rawText && rawText.length < 150 ? rawText : '') || ('Server error (' + r.status + '). Please try again.');
+          throw new Error(msg);
+        }
         return j;
       });
     });
@@ -118,7 +123,7 @@
             showModal('Request received', MESSAGES[product].details, true);
             return;
           }
-          return startPayment(res.leadId, product, form);
+          return startPayment(res.leadId, product, form, res.leadToken);
         })
         .catch(function (err) {
           loader.hidden = true;
@@ -139,8 +144,8 @@
     });
   }
 
-  function startPayment(leadId, product, form) {
-    return Promise.all([post('/api/order', { leadId: leadId }), waitForRazorpay(10000)]).then(function (r) {
+  function startPayment(leadId, product, form, leadToken) {
+    return Promise.all([post('/api/order', { leadId: leadId, leadToken: leadToken }), waitForRazorpay(10000)]).then(function (r) {
       var order = r[0];
       var options = {
         key: order.keyId,
@@ -156,7 +161,7 @@
         retry: { enabled: true },
         modal: {
           ondismiss: function () {
-            post('/api/checkout-event', { leadId: leadId, event: 'dismissed' }).catch(function () {});
+            post('/api/checkout-event', { leadId: leadId, leadToken: leadToken, event: 'dismissed' }).catch(function () {});
             setMsg(form, 'Payment was not completed. Tap the button again to retry.', 'error');
           },
           confirm_close: true,
@@ -167,6 +172,7 @@
           loader.querySelector('p').textContent = 'Confirming your payment…';
           post('/api/verify', {
             leadId: leadId,
+            leadToken: leadToken,
             razorpay_order_id: resp.razorpay_order_id,
             razorpay_payment_id: resp.razorpay_payment_id,
             razorpay_signature: resp.razorpay_signature,
@@ -180,12 +186,14 @@
       };
       if (isInApp) {
         options.redirect = true;
-        options.callback_url = location.origin + '/api/razorpay/callback?lead=' + encodeURIComponent(leadId);
+        var cb = location.origin + '/api/razorpay/callback?lead=' + encodeURIComponent(leadId);
+        if (leadToken) cb += '&token=' + encodeURIComponent(leadToken);
+        options.callback_url = cb;
       }
       var rzp = new window.Razorpay(options);
       rzp.on('payment.failed', function (resp) {
         var reason = (resp && resp.error && resp.error.description) || 'Payment failed';
-        post('/api/checkout-event', { leadId: leadId, event: 'failed', reason: reason }).catch(function () {});
+        post('/api/checkout-event', { leadId: leadId, leadToken: leadToken, event: 'failed', reason: reason }).catch(function () {});
       });
       loader.hidden = true;
       rzp.open();

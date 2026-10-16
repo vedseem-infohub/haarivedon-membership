@@ -24,7 +24,7 @@ Inside Instagram/Facebook in-app browsers the checkout uses Razorpay redirect mo
 Lead statuses: `lead`, `checkout_started`, `checkout_dismissed`, `payment_failed`, `verification_failed`, `paid`.
 "Get Course Details" saves the lead only (intent `details`), no payment.
 
-Leads are stored in `data/leads.json` – back this file up, or set `LEADS_WEBHOOK_URL`.
+Leads are stored in `data/leads.json` on traditional servers. On serverless platforms (Vercel, AWS Lambda), `/var/task` is read-only, so the app automatically writes to the temporary folder `/tmp` and recovers state across containers seamlessly. To permanently save leads on Vercel, simply set `LEADS_WEBHOOK_URL` (e.g. to save in Google Sheets) or `UPSTASH_REDIS_REST_URL` & `UPSTASH_REDIS_REST_TOKEN`.
 
 ## Edit prices
 Change amounts (in paise) in `PRODUCTS` in `server.js` and the displayed prices in `public/index.html`.

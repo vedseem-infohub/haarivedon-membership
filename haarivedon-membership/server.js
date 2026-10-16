@@ -3,6 +3,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 (function loadEnv() {
   const file = path.join(__dirname, '.env');
@@ -16,10 +17,65 @@ const crypto = require('crypto');
 const PORT = Number(process.env.PORT) || 3000;
 const KEY_ID = process.env.RAZORPAY_KEY_ID || '';
 const KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const LEADS_WEBHOOK_URL = process.env.LEADS_WEBHOOK_URL || '';
+const KV_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const TOKEN_SECRET = KEY_SECRET || ADMIN_PASSWORD || process.env.TOKEN_SECRET || 'haarivedon-membership-secret-token';
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const DATA_FILE = path.join(__dirname, 'data', 'leads.json');
+
+// Resolve data storage location.
+// In serverless environments (e.g. AWS Lambda, Vercel), /var/task is read-only.
+// Attempting to write there throws "EROFS: read-only file system".
+// In those environments we automatically route writes to os.tmpdir() (/tmp),
+// cache in-memory, and sync to KV/webhook if configured.
+function resolveDataFile() {
+  if (process.env.DATA_FILE) return process.env.DATA_FILE;
+  if (process.env.DATA_DIR) return path.join(process.env.DATA_DIR, 'leads.json');
+
+  const isServerless = Boolean(
+    process.env.VERCEL ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT ||
+    process.env.NETLIFY ||
+    __dirname.startsWith('/var/task') ||
+    __dirname.startsWith('/var/runtime')
+  );
+
+  if (isServerless) {
+    return path.join(os.tmpdir(), 'leads.json');
+  }
+
+  const defaultDir = path.join(__dirname, 'data');
+  try {
+    fs.mkdirSync(defaultDir, { recursive: true });
+    return path.join(defaultDir, 'leads.json');
+  } catch (err) {
+    if (err.code === 'EROFS' || err.code === 'EACCES') {
+      return path.join(os.tmpdir(), 'leads.json');
+    }
+    return path.join(defaultDir, 'leads.json');
+  }
+}
+
+let DATA_FILE = resolveDataFile();
+let leadsCache = [];
+
+(function initLeads() {
+  const localFile = path.join(__dirname, 'data', 'leads.json');
+  try {
+    if (fs.existsSync(localFile)) {
+      const data = JSON.parse(fs.readFileSync(localFile, 'utf8'));
+      if (Array.isArray(data)) leadsCache = data;
+    }
+  } catch (_) { }
+  try {
+    if (DATA_FILE !== localFile && fs.existsSync(DATA_FILE)) {
+      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      if (Array.isArray(data) && data.length > leadsCache.length) leadsCache = data;
+    }
+  } catch (_) { }
+})();
 
 // Prices live on the server so they cannot be changed from the browser.
 const PRODUCTS = {
@@ -34,23 +90,140 @@ const MIME = {
 };
 
 function readLeads() {
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch { return []; }
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const content = fs.readFileSync(DATA_FILE, 'utf8');
+      const data = JSON.parse(content);
+      if (Array.isArray(data)) {
+        leadsCache = data;
+        return data;
+      }
+    }
+  } catch (e) {
+    // Return cache if file read fails or file is not accessible
+  }
+  return leadsCache;
 }
+
+function syncLeadsToKv(leads) {
+  if (!KV_URL || !KV_TOKEN) return;
+  fetch(`${KV_URL}/set/leads`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(JSON.stringify(leads)),
+  }).catch((e) => console.error('KV sync failed:', e.message));
+}
+
+async function fetchLeadsFromKv() {
+  if (!KV_URL || !KV_TOKEN) return null;
+  try {
+    const res = await fetch(`${KV_URL}/get/leads`, {
+      headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.result) return null;
+    const parsed = typeof data.result === 'string' ? JSON.parse(data.result) : data.result;
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (e) {
+    console.error('KV fetch failed:', e.message);
+    return null;
+  }
+}
+
 function writeLeads(leads) {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  const tmp = DATA_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(leads, null, 2));
-  fs.renameSync(tmp, DATA_FILE);
+  leadsCache = leads;
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    const tmp = DATA_FILE + '.' + process.pid + '.' + Date.now() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(leads, null, 2));
+    fs.renameSync(tmp, DATA_FILE);
+  } catch (err) {
+    if (err.code === 'EROFS' || err.code === 'EACCES' || err.code === 'EPERM') {
+      console.warn(`Write to ${DATA_FILE} failed (${err.code}). Falling back to temporary directory.`);
+      const fallbackFile = path.join(os.tmpdir(), 'leads.json');
+      if (DATA_FILE !== fallbackFile) {
+        DATA_FILE = fallbackFile;
+        try {
+          fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+          const tmp = DATA_FILE + '.' + process.pid + '.' + Date.now() + '.tmp';
+          fs.writeFileSync(tmp, JSON.stringify(leads, null, 2));
+          fs.renameSync(tmp, DATA_FILE);
+        } catch (innerErr) {
+          console.error('Failed to write leads to tmpdir fallback:', innerErr.message);
+        }
+      }
+    } else {
+      console.error('Failed to write leads file:', err.message);
+    }
+  }
+  syncLeadsToKv(leads);
 }
-function updateLead(id, patch) {
+
+function createLeadToken(lead) {
+  try {
+    const payload = Buffer.from(JSON.stringify({
+      id: lead.id,
+      product: lead.product,
+      name: lead.name,
+      mobile: lead.mobile,
+      address: lead.address,
+      dob: lead.dob,
+      amount: lead.amount,
+      intent: lead.intent,
+      createdAt: lead.createdAt,
+    })).toString('base64url');
+    const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('base64url');
+    return `${payload}.${sig}`;
+  } catch {
+    return '';
+  }
+}
+
+function verifyLeadToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [payload, sig] = parts;
+  const expectedSig = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('base64url');
+  const a = Buffer.from(sig), b = Buffer.from(expectedSig);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function findOrRecoverLead(id, token) {
+  if (!id) return null;
   const leads = readLeads();
-  const lead = leads.find((l) => l.id === id);
+  let lead = leads.find((l) => l.id === id);
+  if (!lead && token) {
+    const recovered = verifyLeadToken(token);
+    if (recovered && recovered.id === id) {
+      lead = { ...recovered, status: 'lead' };
+      leads.push(lead);
+      writeLeads(leads);
+    }
+  }
+  return lead;
+}
+
+function updateLead(id, patch, fallbackLead = null) {
+  const leads = readLeads();
+  let lead = leads.find((l) => l.id === id);
+  if (!lead && fallbackLead && fallbackLead.id === id) {
+    lead = fallbackLead;
+    leads.push(lead);
+  }
   if (!lead) return null;
   Object.assign(lead, patch, { updatedAt: new Date().toISOString() });
   writeLeads(leads);
   forwardLead(lead);
   return lead;
 }
+
 function forwardLead(lead) {
   if (!LEADS_WEBHOOK_URL) return;
   fetch(LEADS_WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(lead) })
@@ -58,11 +231,39 @@ function forwardLead(lead) {
 }
 
 function send(res, status, body, headers = {}) {
-  const isObj = typeof body === 'object' && !Buffer.isBuffer(body);
-  res.writeHead(status, { 'Content-Type': isObj ? 'application/json' : 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
-  res.end(isObj ? JSON.stringify(body) : body);
+  let content = body;
+  let isJson = true;
+  if (typeof body === 'string') {
+    if (status >= 400) {
+      content = JSON.stringify({ error: body });
+    } else {
+      isJson = false;
+    }
+  } else if (typeof body === 'object' && !Buffer.isBuffer(body)) {
+    content = JSON.stringify(body);
+  } else {
+    isJson = false;
+  }
+  res.writeHead(status, {
+    'Content-Type': isJson ? 'application/json' : 'text/plain; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...headers,
+  });
+  res.end(content);
 }
+
 function readBody(req) {
+  if (req.body) {
+    if (typeof req.body === 'object' && req.body !== null) return Promise.resolve(req.body);
+    if (typeof req.body === 'string') {
+      try { return Promise.resolve(JSON.parse(req.body)); } catch {
+        return Promise.resolve(Object.fromEntries(new URLSearchParams(req.body)));
+      }
+    }
+  }
+  if (req.readableEnded) {
+    return Promise.resolve({});
+  }
   return new Promise((resolve, reject) => {
     let data = '';
     req.on('data', (c) => { data += c; if (data.length > 1e5) { reject(new Error('Body too large')); req.destroy(); } });
@@ -157,17 +358,17 @@ async function handleApi(req, res, url) {
     leads.push(lead);
     writeLeads(leads);
     forwardLead(lead);
-    return send(res, 200, { leadId: lead.id });
+    return send(res, 200, { leadId: lead.id, leadToken: createLeadToken(lead) });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/order') {
     if (rateLimited(ip)) return send(res, 429, { error: 'Too many requests. Please try again later.' });
     const b = await readBody(req);
-    const lead = readLeads().find((l) => l.id === b.leadId);
+    const lead = findOrRecoverLead(b.leadId, b.leadToken);
     if (!lead) return send(res, 404, { error: 'Lead not found' });
     if (!KEY_ID || !KEY_SECRET) return send(res, 500, { error: 'Payment gateway not configured' });
     const order = await createOrder(lead);
-    updateLead(lead.id, { orderId: order.id, status: 'checkout_started' });
+    updateLead(lead.id, { orderId: order.id, status: 'checkout_started' }, lead);
     const p = PRODUCTS[lead.product];
     return send(res, 200, {
       keyId: KEY_ID, orderId: order.id, amount: order.amount, currency: order.currency,
@@ -177,30 +378,35 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'POST' && url.pathname === '/api/verify') {
     const b = await readBody(req);
-    const lead = readLeads().find((l) => l.id === b.leadId);
+    const lead = findOrRecoverLead(b.leadId, b.leadToken);
     if (!lead) return send(res, 404, { error: 'Lead not found' });
-    const ok = b.razorpay_order_id === lead.orderId && verifySignature(b.razorpay_order_id, b.razorpay_payment_id, b.razorpay_signature);
+    const orderMatches = !lead.orderId || b.razorpay_order_id === lead.orderId;
+    const ok = orderMatches && verifySignature(b.razorpay_order_id, b.razorpay_payment_id, b.razorpay_signature);
     if (!ok) {
       if (lead.status === 'paid') return send(res, 200, { ok: true, product: lead.product });
-      updateLead(lead.id, { status: 'verification_failed' }); return send(res, 400, { error: 'Payment verification failed' });
+      updateLead(lead.id, { status: 'verification_failed' }, lead);
+      return send(res, 400, { error: 'Payment verification failed' });
     }
-    updateLead(lead.id, { status: 'paid', paymentId: b.razorpay_payment_id, paidAt: new Date().toISOString() });
+    updateLead(lead.id, { status: 'paid', orderId: b.razorpay_order_id, paymentId: b.razorpay_payment_id, paidAt: new Date().toISOString() }, lead);
     return send(res, 200, { ok: true, product: lead.product });
   }
 
   // Redirect-mode callback (used inside in-app browsers like Instagram / Facebook on iOS & Android).
   if (req.method === 'POST' && url.pathname === '/api/razorpay/callback') {
     const b = await readBody(req);
-    const lead = readLeads().find((l) => l.id === url.searchParams.get('lead'));
-    const product = lead ? lead.product : 'membership';
+    const leadId = url.searchParams.get('lead') || b.leadId;
+    const leadToken = url.searchParams.get('token') || b.leadToken;
+    const lead = findOrRecoverLead(leadId, leadToken);
+    const product = lead ? lead.product : (url.searchParams.get('product') || 'membership');
     let status = 'failed';
-    if (lead && b.razorpay_payment_id && b.razorpay_order_id === lead.orderId && verifySignature(b.razorpay_order_id, b.razorpay_payment_id, b.razorpay_signature)) {
-      updateLead(lead.id, { status: 'paid', paymentId: b.razorpay_payment_id, paidAt: new Date().toISOString() });
+    const orderMatches = !lead || !lead.orderId || b.razorpay_order_id === lead.orderId;
+    if (lead && b.razorpay_payment_id && orderMatches && verifySignature(b.razorpay_order_id, b.razorpay_payment_id, b.razorpay_signature)) {
+      updateLead(lead.id, { status: 'paid', orderId: b.razorpay_order_id, paymentId: b.razorpay_payment_id, paidAt: new Date().toISOString() }, lead);
       status = 'success';
     } else if (lead && lead.status === 'paid') {
       status = 'success';
     } else if (lead) {
-      updateLead(lead.id, { status: 'payment_failed', failureReason: clean(b['error[description]'] || b.error_description, 200) });
+      updateLead(lead.id, { status: 'payment_failed', failureReason: clean(b['error[description]'] || b.error_description, 200) }, lead);
     }
     res.writeHead(303, { Location: `/thank-you.html?product=${product}&status=${status}` });
     return res.end();
@@ -208,21 +414,30 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'POST' && url.pathname === '/api/checkout-event') {
     const b = await readBody(req);
-    const lead = readLeads().find((l) => l.id === b.leadId);
+    const lead = findOrRecoverLead(b.leadId, b.leadToken);
     if (lead && lead.status !== 'paid') {
       const event = b.event === 'failed' ? 'payment_failed' : 'checkout_dismissed';
-      updateLead(lead.id, { status: event, failureReason: clean(b.reason, 200) });
+      updateLead(lead.id, { status: event, failureReason: clean(b.reason, 200) }, lead);
     }
     return send(res, 200, { ok: true });
   }
 
   if (req.method === 'GET' && url.pathname === '/api/admin/leads') {
     if (!isAdmin(req)) return send(res, 401, { error: 'Unauthorized' });
-    const leads = readLeads().slice().reverse();
-    if (url.searchParams.get('format') === 'csv') {
-      return send(res, 200, toCsv(leads), { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="haarivedon-leads.csv"' });
+    let leads = readLeads();
+    const kvLeads = await fetchLeadsFromKv();
+    if (kvLeads && Array.isArray(kvLeads)) {
+      const map = new Map();
+      for (const l of leads) map.set(l.id, l);
+      for (const l of kvLeads) map.set(l.id, l);
+      leads = Array.from(map.values());
+      leads.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
     }
-    return send(res, 200, { leads });
+    const reversed = leads.slice().reverse();
+    if (url.searchParams.get('format') === 'csv') {
+      return send(res, 200, toCsv(reversed), { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="haarivedon-leads.csv"' });
+    }
+    return send(res, 200, { leads: reversed });
   }
 
   return send(res, 404, { error: 'Not found' });
@@ -245,8 +460,11 @@ function serveStatic(req, res, url) {
   });
 }
 
-http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost');
+const server = http.createServer(async (req, res) => {
+  const host = req.headers.host || 'localhost';
+  const rawUrl = req.headers['x-matched-path'] || req.headers['x-forwarded-uri'] || req.url || '/';
+  const resolvedUrl = rawUrl.startsWith('/api/') ? rawUrl : req.url;
+  const url = new URL(resolvedUrl, `http://${host}`);
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed');
@@ -255,4 +473,10 @@ http.createServer(async (req, res) => {
     console.error(e);
     return send(res, 500, { error: e.message || 'Server error' });
   }
-}).listen(PORT, () => console.log(`Haarivedon landing page running on http://localhost:${PORT}`));
+});
+
+if (require.main === module || !process.env.VERCEL) {
+  server.listen(PORT, () => console.log(`Haarivedon landing page running on http://localhost:${PORT}`));
+}
+
+module.exports = server;
