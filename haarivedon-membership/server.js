@@ -475,8 +475,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-if (require.main === module || !process.env.VERCEL) {
-  server.listen(PORT, () => console.log(`Haarivedon landing page running on http://localhost:${PORT}`));
-}
+server.listen(PORT, () => console.log(`Haarivedon landing page running on http://localhost:${PORT}`));
 
 module.exports = server;
