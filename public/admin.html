@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Leads – HaarivedOn Admin</title>
+  <link rel="icon" href="assets/logo.png">
+  <style>
+    body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#f4f7f5;color:#1d2b25}
+    header{background:#0b3d2e;color:#fff;padding:14px 20px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+    header h1{font-size:18px;margin:0}
+    main{padding:20px}
+    input,select,button{font:inherit;font-size:16px;padding:9px 12px;border-radius:8px;border:1px solid #c6d4cc}
+    button{background:#e8b53a;border:0;font-weight:600;cursor:pointer}
+    .bar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
+    .wrap{overflow:auto;background:#fff;border-radius:12px;box-shadow:0 4px 14px rgba(0,0,0,.06)}
+    table{border-collapse:collapse;width:100%;font-size:13px}
+    th,td{padding:9px 10px;border-bottom:1px solid #e5ece8;text-align:left;white-space:nowrap}
+    td.addr{white-space:normal;min-width:200px}
+    th{background:#e6f2ec;position:sticky;top:0}
+    .s{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;background:#eee}
+    .s.paid{background:#d6f5e3;color:#0f5132}.s.lead{background:#fff4d6;color:#8a6200}
+    .s.payment_failed,.s.verification_failed{background:#fbe0e0;color:#8b1a1a}
+    #login{max-width:340px;margin:12vh auto;background:#fff;padding:24px;border-radius:14px;display:grid;gap:12px;box-shadow:0 4px 14px rgba(0,0,0,.08)}
+    .muted{color:#5b6b63;font-size:13px}
+  </style>
+</head>
+<body>
+  <header><h1>HaarivedOn · Leads &amp; Payments</h1><span class="muted" style="color:#cfe3d8" id="count"></span></header>
+  <form id="login">
+    <b>Admin login</b>
+    <input type="password" id="pw" placeholder="Admin password" autocomplete="current-password" required>
+    <button>View leads</button>
+    <span class="muted" id="err"></span>
+  </form>
+  <main id="app" hidden>
+    <div class="bar">
+      <select id="fp"><option value="">All products</option><option value="membership">Membership</option><option value="course">Course</option></select>
+      <select id="fs"><option value="">All statuses</option><option>paid</option><option>lead</option><option>checkout_started</option><option>checkout_dismissed</option><option>payment_failed</option><option>verification_failed</option></select>
+      <input id="q" placeholder="Search name / mobile">
+      <button type="button" id="csv">Download CSV</button>
+      <button type="button" id="refresh">Refresh</button>
+    </div>
+    <div class="wrap"><table><thead><tr><th>Date</th><th>Product</th><th>Status</th><th>Name</th><th>Mobile</th><th>DOB</th><th>Address</th><th>Amount</th><th>Payment ID</th></tr></thead><tbody id="rows"></tbody></table></div>
+  </main>
+  <script>
+    (function () {
+      var pw = sessionStorage.getItem('hv_admin') || '';
+      var all = [];
+      var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
+      var API_BASE = ((location.hostname === 'localhost' || location.hostname === '127.0.0.1') && location.port && location.port !== '3000')
+        ? (location.protocol + '//' + location.hostname + ':3000')
+        : '';
+      function load() {
+        return fetch(API_BASE + '/api/admin/leads', { headers: { 'x-admin-password': pw } }).then(function (r) {
+          if (!r.ok) throw new Error('Wrong password');
+          return r.json();
+        }).then(function (j) {
+          all = j.leads; sessionStorage.setItem('hv_admin', pw);
+          document.getElementById('login').hidden = true; document.getElementById('app').hidden = false; render();
+        });
+      }
+      function render() {
+        var p = document.getElementById('fp').value, s = document.getElementById('fs').value, q = document.getElementById('q').value.toLowerCase();
+        var list = all.filter(function (l) { return (!p || l.product === p) && (!s || l.status === s) && (!q || (l.name + ' ' + l.mobile).toLowerCase().indexOf(q) > -1); });
+        document.getElementById('count').textContent = list.length + ' of ' + all.length + ' records · ' + all.filter(function (l) { return l.status === 'paid'; }).length + ' paid';
+        document.getElementById('rows').innerHTML = list.map(function (l) {
+          return '<tr><td>' + esc(new Date(l.createdAt).toLocaleString('en-IN')) + '</td><td>' + esc(l.product) + (l.intent === 'details' ? ' (details)' : '') + '</td><td><span class="s ' + esc(l.status) + '">' + esc(l.status) + '</span></td><td>' + esc(l.name) + '</td><td><a href="tel:+91' + esc(l.mobile) + '">' + esc(l.mobile) + '</a> · <a target="_blank" rel="noopener" href="https://wa.me/91' + esc(l.mobile) + '">WhatsApp</a></td><td>' + esc(l.dob) + '</td><td class="addr">' + esc(l.address) + '</td><td>₹' + esc(l.amount) + '</td><td>' + esc(l.paymentId) + '</td></tr>';
+        }).join('');
+      }
+      document.getElementById('login').addEventListener('submit', function (e) {
+        e.preventDefault(); pw = document.getElementById('pw').value;
+        load().catch(function (err) { document.getElementById('err').textContent = err.message; });
+      });
+      ['fp', 'fs', 'q'].forEach(function (id) { document.getElementById(id).addEventListener('input', render); });
+      document.getElementById('refresh').addEventListener('click', load);
+      document.getElementById('csv').addEventListener('click', function () {
+        fetch(API_BASE + '/api/admin/leads?format=csv', { headers: { 'x-admin-password': pw } }).then(function (r) { return r.blob(); }).then(function (b) {
+          var a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'haarivedon-leads.csv'; document.body.appendChild(a); a.click(); a.remove();
+        });
+      });
+      if (pw) load().catch(function () { sessionStorage.removeItem('hv_admin'); });
+    })();
+  </script>
+</body>
+</html>
